@@ -7,7 +7,10 @@ use Illuminate\Support\Facades\Http;
 
 class ChatController extends Controller
 {
-    private string $fastapiUrl = 'http://localhost:8000';
+    private function fastapiUrl(): string
+    {
+        return env('FASTAPI_URL', 'http://localhost:8000');
+    }
 
     public function index()
     {
@@ -28,7 +31,7 @@ class ChatController extends Controller
 
         try {
             $response = Http::timeout(120)
-                ->post("{$this->fastapiUrl}/chat", $payload);
+                ->post($this->fastapiUrl() . '/chat', $payload);
         } catch (\Exception $e) {
             return response()->json([
                 'error' => 'Service IA injoignable',
@@ -53,21 +56,43 @@ class ChatController extends Controller
 
     public function reset(Request $request)
     {
-        $sessionId = $request->json('session_id');
+        $sessionId = $request->input('session_id', '');
+        $url = $this->fastapiUrl() . '/chat/reset';
 
-        if ($sessionId) {
-            try {
-                Http::timeout(10)->post("{$this->fastapiUrl}/chat/reset", [], [
-                    'query' => ['session_id' => $sessionId],
-                ]);
-            } catch (\Exception $e) {
-                // On ignore l'erreur, on reset côté client de toute façon
-            }
+        try {
+            $response = Http::timeout(10)->post($url . '?session_id=' . urlencode($sessionId));
+        } catch (\Exception $e) {
+            return response()->json(['error' => 'Reset failed', 'detail' => $e->getMessage()], 503);
         }
 
-        return response()->json([
-    'response' => 'Conversation réinitialisée',
-    'session_id' => null,
-]);
+        if ($response->failed()) {
+            return response()->json(['error' => 'Reset failed'], 503);
+        }
+
+        return response()->json($response->json());
+    }
+
+    public function sendVoice(Request $request)
+    {
+        $request->validate([
+            'audio' => 'required|file',
+            'session_id' => 'nullable|string',
+        ]);
+
+        try {
+            $response = Http::timeout(120)
+                ->attach('audio', file_get_contents($request->file('audio')->path()), 'voice.webm')
+                ->post($this->fastapiUrl() . '/chat-voice', [
+                    'session_id' => $request->input('session_id', ''),
+                ]);
+        } catch (\Exception $e) {
+            return response()->json(['error' => 'Bob est indisponible', 'detail' => $e->getMessage()], 503);
+        }
+
+        if ($response->failed()) {
+            return response()->json(['error' => 'Erreur du service IA', 'detail' => $response->body()], $response->status());
+        }
+
+        return response()->json($response->json());
     }
 }

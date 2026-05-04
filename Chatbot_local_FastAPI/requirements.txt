@@ -3,3 +3,6 @@ uvicorn
 ollama
 pydantic
 python-dotenv
+faster-whisper
+edge-tts
+python-multipart

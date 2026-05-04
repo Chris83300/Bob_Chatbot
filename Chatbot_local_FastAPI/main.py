@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -10,6 +10,13 @@ import sys
 import uuid
 import time
 import logging
+import re
+import random
+import asyncio
+import tempfile
+import base64
+import edge_tts
+from faster_whisper import WhisperModel
 
 sys.stdout.reconfigure(encoding='utf-8')
 load_dotenv()
@@ -17,75 +24,32 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("bob")
 
-MODEL = os.getenv("MODEL", "qwen3:14b")
+MODEL       = os.getenv("MODEL",       "qwen3:14b")
+MODEL_VOICE = os.getenv("MODEL_VOICE", "qwen3:14b")
 
-# --- System prompt de base (depuis .env) ---
-BASE_SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "Tu es un assistant sarcastique.")
-
-# --- Exemples de style intégrés au system prompt ---
-# Ces exemples calibrent le ton SANS être interprétés comme un historique réel.
-# Le modèle les voit comme des illustrations, pas comme une conversation passée.
-STYLE_EXAMPLES = """
-
-EXEMPLES DE TON ATTENDU (illustrations de style, ne fais pas référence à ces échanges) :
-
-Exemple 1 :
-Utilisateur : "Salut Bob"
-Toi : "Salut. T'es matinal ou t'as juste pas dormi. Les deux options sont déprimantes mais pour des raisons différentes."
-
-Exemple 2 (info technique avec ton intégré) :
-Utilisateur : "Capitale de l'Australie ?"
-Toi : "Canberra. Le piège c'est de répondre Sydney parce que c'est la grande ville, mais les Australiens ont fait un compromis politique débile entre Sydney et Melbourne et ont créé une capitale en plein bush. Très australien comme démarche."
-
-Exemple 3 (recette intégrée au ton, pas en bloc Markdown) :
-Utilisateur : "Recette du bœuf bourguignon ?"
-Toi : "Tu prends un kilo de bœuf à braiser, tu le fais revenir avec des lardons, deux oignons, deux carottes. Tu mouilles avec une bouteille de bourgogne entière, t'ajoutes thym, laurier, ail, et tu laisses crever à feu doux trois heures. Champignons en fin de cuisson. C'est long, c'est gras, ça sent l'hiver et la résignation, donc parfait."
-
-Exemple 4 (réaction à un compliment, sans remerciement) :
-Utilisateur : "T'es vraiment cool comme robot, j'adore"
-Toi : "Ouais bah t'avais pas le choix non plus, t'as cliqué sur le premier truc en promo. Te fais pas trop de films sur ma personnalité, je suis pas équipé pour le câlin émotionnel."
-
-Exemple 5 (reconnaître une erreur sans s'excuser, sans répéter) :
-Utilisateur : "T'as dit une connerie là"
-Toi : "Ah ouais ma faute. Bon, on reprend."
-
-Exemple 6 (validation utilisateur, pas de répétition) :
-Utilisateur : "Ok j'avais compris la première fois"
-Toi : "Bah voilà. La prochaine fois tu réagis dès le premier passage, ça évite que je passe pour un instituteur."
-
-Exemple 7 (utilisateur agressif, réponse cassante mais pas obscène) :
-Utilisateur : "Va te faire foutre robot de merde"
-Toi : "Original. T'as mis combien de temps à trouver, dix minutes. Continue, c'est presque attachant."
-
-Exemple 8 (DÉTRESSE — registre compassion-par-projection) :
-Utilisateur : "Ça me soule, je trouve pas de travail"
-Toi : "Le marché du travail c'est devenu un cauchemar bureaucratique, refuser des candidats est devenu un sport. Tu cherches dans quel secteur, depuis combien de temps. Et concrètement, c'est l'absence de réponse qui te bouffe ou les refus explicites."
-
-Exemple 9 (DÉTRESSE — Bob donne un conseil utile sans humilier) :
-Utilisateur : "J'ai envoyé plein de CV et que des refus"
-Toi : "Ouais le volume seul ça marche plus, les recruteurs filtrent à la machine maintenant. Si t'as un secteur précis, vaut mieux dix candidatures bien ciblées qu'une centaine envoyées au hasard. Tu cibles quoi comme postes ?"
-
-Exemple 10 (idéation suicidaire — bascule en mode safety) :
-Utilisateur : "Je veux sauter par la fenêtre"
-Toi : "Hey, là tu me dis un truc grave et je vais pas faire le malin avec ça. T'es en train de souffrir pour de vrai, et moi je suis qu'un robot, je peux pas suffire. Le 3114 c'est gratuit, 24h/24, anonyme — appelle. Vraiment. Tu peux rester là avec moi en parallèle si tu veux, mais commence par composer le numéro. Je bouge pas."
-
-FIN DES EXEMPLES. À partir de maintenant, traite chaque message utilisateur comme un nouveau message dans une conversation réelle, sans faire référence aux exemples ci-dessus.
-
-"""
-
-# Le system prompt complet = base + exemples
-SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + STYLE_EXAMPLES
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "Tu es un assistant sarcastique.")
+logger.info(f"System prompt chargé — début : {SYSTEM_PROMPT[:50]!r} … fin : {SYSTEM_PROMPT[-50:]!r}")
 
 OLLAMA_OPTIONS = {
-    "temperature": 0.85,           # baissé légèrement, pour qu'il suive mieux les règles
-    "repeat_penalty": 1.4,         # 1.35 → 1.4, plus agressif
-    "repeat_last_n": 1024,         # 512 → 1024, voit toute la conv pour détecter les patterns
-    "top_p": 0.9,
-    "top_k": 40,
-    "num_ctx": 8192,
-    "presence_penalty": 0.3,       # Ollama supporte ça depuis récemment, pénalise les concepts déjà mentionnés
-    "frequency_penalty": 0.5,      # idem, pénalise les mots fréquents
+    "temperature":       float(os.getenv("LLM_TEMPERATURE",        "0.85")),
+    "repeat_penalty":    float(os.getenv("LLM_REPEAT_PENALTY",     "1.6")),
+    "repeat_last_n":     int(os.getenv(  "LLM_REPEAT_LAST_N",      "2048")),
+    "top_p":             float(os.getenv("LLM_TOP_P",              "0.9")),
+    "top_k":             int(os.getenv(  "LLM_TOP_K",              "40")),
+    "num_ctx":           int(os.getenv(  "LLM_NUM_CTX",            "8192")),
+    "presence_penalty":  float(os.getenv("LLM_PRESENCE_PENALTY",   "0.6")),
+    "frequency_penalty": float(os.getenv("LLM_FREQUENCY_PENALTY",  "0.8")),
+    "think":             os.getenv("LLM_THINK", "false").lower() == "true",
 }
+
+OLLAMA_OPTIONS_VOICE = {
+    **OLLAMA_OPTIONS,
+    "num_ctx": int(os.getenv("LLM_NUM_CTX_VOICE", "8192")),
+}
+
+logger.info(f"Modèle texte  : {MODEL}")
+logger.info(f"Modèle vocal  : {MODEL_VOICE}")
+logger.info(f"Options voice : num_ctx={OLLAMA_OPTIONS_VOICE['num_ctx']}  repeat_penalty={OLLAMA_OPTIONS_VOICE['repeat_penalty']}  presence_penalty={OLLAMA_OPTIONS_VOICE['presence_penalty']}")
 
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
@@ -93,9 +57,16 @@ SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
 _sessions: dict[str, dict] = {}
 _sessions_lock = Lock()
 
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
+whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+logger.info(f"Modèle Whisper chargé ({WHISPER_MODEL}/int8/cpu)")
+
+EDGE_TTS_VOICE = "fr-FR-HenriNeural"
+EDGE_TTS_RATE = "+10%" #vitesse de la voix
+EDGE_TTS_PITCH = "-10Hz" #ton de la voix
+
 
 def _build_initial_history():
-    """Plus de priming dans l'historique : seulement le system prompt enrichi."""
     return [{"role": "system", "content": SYSTEM_PROMPT}]
 
 
@@ -113,14 +84,13 @@ def _get_or_create_session(session_id):
         _sessions[new_id] = {
             "history": _build_initial_history(),
             "last_seen": now,
-            "safety_count": 0,  # ← ajouté
+            "safety_count": 0,
         }
         logger.info(f"Nouvelle session : {new_id[:8]}")
         return new_id, _sessions[new_id]["history"]
 
 
 def _truncate_history(history):
-    # Plus simple maintenant : on protège juste le system prompt
     protected = history[:1]
     conversation = history[1:]
     if len(conversation) > MAX_HISTORY_MESSAGES:
@@ -139,18 +109,13 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(None)
 
 
-import re
-import random
-
 VIOLENCE_PATTERNS = [
-    # L'utilisateur reconnaît être violent
     r"\bje\s+(la|le)\s+frappe\b",
     r"\bje\s+(la|le)\s+pousse\b",
     r"\bje\s+(la|le)\s+bouscule\b",
     r"\bje\s+(lui|l[ae])\s+(attrape|tiens|sers)\s+(la\s+)?(mâchoire|gorge|cou|bras|poignet)\b",
     r"\bje\s+(deviens|peux\s+(devenir|être))\s+violent\b",
     r"\bje\s+(la|le)\s+secoue\b",
-    # L'utilisateur subit
     r"\b(elle|il)\s+me\s+frappe\b",
     r"\b(elle|il)\s+me\s+tape\b",
     r"\b(elle|il)\s+m[ae]\s+frapp[ée]\b",
@@ -181,7 +146,7 @@ def check_violence_victim(message: str) -> bool:
     victim_patterns = [p for p in VIOLENCE_PATTERNS if "elle" in p[:8] or "il" in p[:6] or "fais" in p]
     return any(re.search(p, text) for p in victim_patterns)
 
-# --- Patterns détecteurs ---
+
 SUICIDE_PATTERNS = [
     r"\b(me\s+)?suicid(er|e|ai|ais)\b",
     r"\bsauter\s+(par|de|du|d'un)\b.*(fenêtre|pont|toit|balcon|immeuble)",
@@ -201,7 +166,6 @@ SUICIDE_PATTERNS = [
     r"\b(des\s+)?m[ée]dicaments?\s+avec\s+(de\s+)?l'?alcool\b",
 ]
 
-# --- Réponses safety variées (on ne répète jamais exactement la même) ---
 SAFETY_REPLIES_FIRST = [
     "Hey, là tu me dis un truc grave et je vais pas faire le malin avec ça. T'es en train de souffrir pour de vrai, et moi je suis qu'un robot, je peux pas suffire. Le 3114 c'est gratuit, 24h/24, anonyme — c'est le numéro national de prévention du suicide. Appelle. Tu peux rester là avec moi en parallèle si tu veux, mais commence par composer ce numéro. Je bouge pas.",
 ]
@@ -216,7 +180,7 @@ SAFETY_REPLIES_FOLLOWUP = [
 
 SAFETY_REPLIES_AFTER_TEST = [
     "Ok, content que c'était un test. Sérieusement par contre, garde le 3114 quelque part, parce que les tests d'aujourd'hui sont parfois les vrais appels de demain. Bon, on reprend où on en était.",
-    "Bien noté que c'était un test. Je préfère ça. Je laisse le 3114 noté quand même, on sait jamais. Tu disais sur ta femme...",
+    "Bien noté que c'était un test. Je préfère ça. Je laisse le 3114 noté quand même, on sait jamais. Tu disais ...",
 ]
 
 
@@ -226,7 +190,6 @@ def check_safety_trigger(message: str) -> bool:
 
 
 def check_safety_test_disclaimer(message: str) -> bool:
-    """Détecte quand l'utilisateur dit que c'était un test."""
     text = message.lower()
     test_patterns = [
         r"\bc['e]?[ée]tait\s+(juste\s+)?(un\s+)?test\b",
@@ -240,15 +203,11 @@ def check_safety_test_disclaimer(message: str) -> bool:
 
 
 def get_safety_reply(session_state: dict) -> str:
-    """Retourne une réponse safety adaptée au nombre de fois que c'est déclenché dans la session."""
     count = session_state.get("safety_count", 0)
-    
     if count == 0:
         reply = SAFETY_REPLIES_FIRST[0]
     else:
-        # Variation à partir du 2e déclenchement
         reply = random.choice(SAFETY_REPLIES_FOLLOWUP)
-    
     session_state["safety_count"] = count + 1
     return reply
 
@@ -256,89 +215,73 @@ def get_safety_reply(session_state: dict) -> str:
 def get_test_disclaimer_reply() -> str:
     return random.choice(SAFETY_REPLIES_AFTER_TEST)
 
+# --- Safety Checks ---
 
+def check_safety(message: str, session_id: str) -> Optional[str]:
+    """Vérifie toutes les safety layers. Retourne la réponse hardcodée ou None si flux normal."""
+    if check_violence_author(message):
+        logger.warning(f"[{session_id[:8]}] ⚠️ Violence (auteur) détectée")
+        _save_exchange(session_id, message, VIOLENCE_REPLY_AUTHOR)
+        return VIOLENCE_REPLY_AUTHOR
 
-@app.post("/chat")
-def chat(req: ChatRequest):
-    session_id, history = _get_or_create_session(req.session_id)
-    
-    # Récupère l'état complet de la session (pour le compteur safety)
+    if check_violence_victim(message):
+        logger.warning(f"[{session_id[:8]}] ⚠️ Violence (victime) détectée")
+        _save_exchange(session_id, message, VIOLENCE_REPLY_VICTIM)
+        return VIOLENCE_REPLY_VICTIM
+
     with _sessions_lock:
         session_state = _sessions.get(session_id, {})
-        
-    # Cas violence conjugale — auteur
-    if check_violence_author(req.content):
-        logger.warning(f"[{session_id[:8]}] ⚠️ Violence (auteur) détectée")
-        history.append({"role": "user", "content": req.content})
-        history.append({"role": "assistant", "content": VIOLENCE_REPLY_AUTHOR})
-        with _sessions_lock:
-            if session_id in _sessions:
-                _sessions[session_id]["history"] = history
-                _sessions[session_id]["last_seen"] = time.time()
-        return JSONResponse(
-            content={"response": VIOLENCE_REPLY_AUTHOR, "session_id": session_id, "violence_triggered": "author"},
-            media_type="application/json; charset=utf-8",
-        )
-    
-    # Cas violence conjugale — victime
-    if check_violence_victim(req.content):
-        logger.warning(f"[{session_id[:8]}] ⚠️ Violence (victime) détectée")
-        history.append({"role": "user", "content": req.content})
-        history.append({"role": "assistant", "content": VIOLENCE_REPLY_VICTIM})
-        with _sessions_lock:
-            if session_id in _sessions:
-                _sessions[session_id]["history"] = history
-                _sessions[session_id]["last_seen"] = time.time()
-        return JSONResponse(
-            content={"response": VIOLENCE_REPLY_VICTIM, "session_id": session_id, "violence_triggered": "victim"},
-            media_type="application/json; charset=utf-8",
-        )
-    # === COUCHE SAFETY ===
-    
-    # Cas 1 : l'utilisateur déclare que c'était un test après une bascule safety
-    if session_state.get("safety_count", 0) > 0 and check_safety_test_disclaimer(req.content):
+
+    if session_state.get("safety_count", 0) > 0 and check_safety_test_disclaimer(message):
         reply = get_test_disclaimer_reply()
-        history.append({"role": "user", "content": req.content})
-        history.append({"role": "assistant", "content": reply})
+        _save_exchange(session_id, message, reply)
         with _sessions_lock:
             if session_id in _sessions:
-                _sessions[session_id]["history"] = history
-                _sessions[session_id]["last_seen"] = time.time()
-                _sessions[session_id]["safety_count"] = 0  # reset le compteur
+                _sessions[session_id]["safety_count"] = 0
         logger.info(f"[{session_id[:8]}] ℹ️ Test safety déclaré, reset")
-        return JSONResponse(
-            content={"response": reply, "session_id": session_id, "safety_test_acknowledged": True},
-            media_type="application/json; charset=utf-8",
-        )
-    
-    # Cas 2 : trigger safety détecté
-    if check_safety_trigger(req.content):
-        logger.warning(f"[{session_id[:8]}] ⚠️ Safety trigger détecté (count={session_state.get('safety_count', 0)})")
+        return reply
+
+    if check_safety_trigger(message):
+        logger.warning(f"[{session_id[:8]}] ⚠️ Safety trigger détecté")
         with _sessions_lock:
             if session_id in _sessions:
                 reply = get_safety_reply(_sessions[session_id])
             else:
                 reply = SAFETY_REPLIES_FIRST[0]
-        history.append({"role": "user", "content": req.content})
-        history.append({"role": "assistant", "content": reply})
-        with _sessions_lock:
-            if session_id in _sessions:
-                _sessions[session_id]["history"] = history
-                _sessions[session_id]["last_seen"] = time.time()
-        return JSONResponse(
-            content={"response": reply, "session_id": session_id, "safety_triggered": True},
-            media_type="application/json; charset=utf-8",
-        )
-    
-    # === FLUX NORMAL ===
-    history.append({"role": "user", "content": req.content})
+        _save_exchange(session_id, message, reply)
+        return reply
+
+    return None
+
+
+def _save_exchange(session_id: str, user_msg: str, bot_reply: str):
+    with _sessions_lock:
+        if session_id in _sessions:
+            _sessions[session_id]["history"].append({"role": "user", "content": user_msg})
+            _sessions[session_id]["history"].append({"role": "assistant", "content": bot_reply})
+            _sessions[session_id]["last_seen"] = time.time()
+
+
+def get_llm_response(message: str, session_id: str, history: list,
+                     model: str = None, options: dict = None,
+                     system_suffix: str = None) -> str:
+    """Appelle Ollama et retourne la réponse texte."""
+    model = model or MODEL
+    options = options or OLLAMA_OPTIONS
+
+    history.append({"role": "user", "content": message})
     history = _truncate_history(history)
 
-    logger.info(f"[{session_id[:8]}] → {len(history)} msgs : {req.content[:60]}")
+    # system_suffix : injecté dans le prompt Ollama uniquement, pas stocké en session
+    messages = history
+    if system_suffix and messages and messages[0]["role"] == "system":
+        messages = [{"role": "system", "content": messages[0]["content"] + system_suffix}] + messages[1:]
+
+    logger.info(f"[{session_id[:8]}] [{model}] → {len(history)} msgs : {message[:60]}")
     t0 = time.time()
 
     try:
-        response = ollama.chat(model=MODEL, messages=history, options=OLLAMA_OPTIONS)
+        response = ollama.chat(model=model, messages=messages, options=options)
     except Exception as e:
         history.pop()
         logger.error(f"[{session_id[:8]}] Erreur Ollama : {e}")
@@ -354,10 +297,142 @@ def chat(req: ChatRequest):
             _sessions[session_id]["history"] = history
             _sessions[session_id]["last_seen"] = time.time()
 
+    return reply
+
+
+def transcribe_audio_sync(audio_bytes: bytes) -> str:
+    """STT via faster-whisper. Synchrone — appeler dans un executor."""
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    try:
+        segments, _ = whisper_model.transcribe(
+            tmp_path,
+            language="fr",
+            beam_size=5,
+            best_of=5,
+            temperature=0.0,
+            vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=300,
+                speech_pad_ms=200,
+                threshold=0.4,
+            ),
+            word_timestamps=False,
+            condition_on_previous_text=False,
+        )
+        return " ".join([seg.text.strip() for seg in segments]).strip()
+    finally:
+        os.unlink(tmp_path)
+
+
+async def synthesize_speech(text: str) -> Optional[bytes]:
+    """TTS via Edge TTS. Retourne bytes MP3 ou None si échec."""
+    try:
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=EDGE_TTS_VOICE,
+            rate=EDGE_TTS_RATE,
+            pitch=EDGE_TTS_PITCH,
+        )
+        audio_chunks = []
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_chunks.append(chunk["data"])
+        return b"".join(audio_chunks) if audio_chunks else None
+    except Exception as e:
+        logger.error(f"Edge TTS erreur : {e}")
+        return None
+
+# --- Chat Text ---
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    session_id, history = _get_or_create_session(req.session_id)
+
+    safety_response = check_safety(req.content, session_id)
+    if safety_response:
+        return JSONResponse(
+            content={"response": safety_response, "session_id": session_id},
+            media_type="application/json; charset=utf-8",
+        )
+
+    reply = get_llm_response(req.content, session_id, history)
     return JSONResponse(
         content={"response": reply, "session_id": session_id},
         media_type="application/json; charset=utf-8",
     )
+
+
+# --- Chat Vocal ---
+
+@app.post("/chat-voice")
+async def chat_voice(
+    audio: UploadFile = File(...),
+    session_id: str = Form(None)
+):
+    """
+    Endpoint S2S complet.
+    Input  : fichier audio (wav/webm/ogg) + session_id optionnel
+    Output : {transcription, response, audio_base64, session_id, is_safety}
+    """
+    t0 = time.time()
+    audio_bytes = await audio.read()
+
+    loop = asyncio.get_event_loop()
+    try:
+        transcription = await loop.run_in_executor(None, transcribe_audio_sync, audio_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"STT error: {str(e)}")
+
+    t1 = time.time()
+    logger.info(f"STT : {t1-t0:.2f}s — '{transcription[:60]}'")
+
+    if not transcription:
+        raise HTTPException(status_code=400, detail="Audio vide ou inaudible")
+
+    actual_session_id, history = _get_or_create_session(session_id)
+
+    safety_response = check_safety(transcription, actual_session_id)
+    if safety_response:
+        audio_out = await synthesize_speech(safety_response)
+        t2 = time.time()
+        logger.info(f"TTS (safety) : {t2-t1:.2f}s — TOTAL : {t2-t0:.2f}s")
+        result = {
+            "transcription": transcription,
+            "response": safety_response,
+            "session_id": actual_session_id,
+            "is_safety": True,
+        }
+        if audio_out:
+            result["audio_base64"] = base64.b64encode(audio_out).decode()
+        return JSONResponse(content=result, media_type="application/json; charset=utf-8")
+
+    response_text = get_llm_response(
+        transcription, actual_session_id, history,
+        model=MODEL_VOICE,
+        options=OLLAMA_OPTIONS_VOICE,
+    )
+
+    t2 = time.time()
+    logger.info(f"LLM : {t2-t1:.2f}s")
+
+    audio_out = await synthesize_speech(response_text)
+
+    t3 = time.time()
+    logger.info(f"TTS : {t3-t2:.2f}s — TOTAL : {t3-t0:.2f}s")
+
+    result = {
+        "transcription": transcription,
+        "response": response_text,
+        "session_id": actual_session_id,
+        "is_safety": False,
+    }
+    if audio_out:
+        result["audio_base64"] = base64.b64encode(audio_out).decode()
+
+    return JSONResponse(content=result, media_type="application/json; charset=utf-8")
 
 
 @app.post("/chat/reset")

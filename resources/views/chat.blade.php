@@ -116,6 +116,25 @@
         #reset-btn:hover {
             color: #fff;
         }
+        #btn-mic {
+            transition: all 0.2s;
+            cursor: pointer;
+            font-size: 1.2rem;
+            padding: 0.4rem 0.7rem;
+            border-radius: 6px;
+            border: 1px solid #333;
+            background: #111;
+            color: #e8e4dc;
+        }
+        #btn-mic:hover:not(:disabled) { background: #666; }
+        #btn-mic.listening  { background: #1a3a1a; animation: pulse 2s infinite; }
+        #btn-mic.speaking   { background: #3a1a1a; animation: pulse 0.5s infinite; }
+        #btn-mic.silence    { background: #3a3a1a; }
+        #btn-mic.processing { background: #1a1a3a; animation: pulse 1s infinite; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50%       { opacity: 0.5; }
+        }
     </style>
 </head>
 <body>
@@ -124,6 +143,7 @@
     <div id="input-area">
         <input type="text" id="message-input" placeholder="Tapez votre message..." autocomplete="off">
         <button id="send-btn" onclick="sendMessage()">Envoyer</button>
+        <button id="btn-mic" title="Parler à Bob">🎙</button>
     </div>
     <div id="controls">
         <span id="session-info">Pas de session active</span>
@@ -237,6 +257,209 @@
         input.addEventListener('keypress', function(e) {
             if (e.key === 'Enter' && !input.disabled) {
                 sendMessage();
+            }
+        });
+
+        // --- Voice / VAD auto-stop ---
+        const VAD_SILENCE_THRESHOLD  = 15;    // RMS en dessous = silence
+        const VAD_SILENCE_DURATION   = 1500;  // ms de silence avant envoi auto
+        const VAD_MIN_SPEECH_DURATION = 300;  // ms de parole min avant activation du silence-timer
+
+        let audioContext, analyser, micStream, mediaRecorder;
+        let audioChunks = [];
+        let silenceTimer = null;
+        let speechDetected = false;
+        let speechStartTime = null;
+        let isListening = false;
+        let isProcessing = false;
+        let voiceModeActive = false;
+
+        const micBtn = document.getElementById('btn-mic');
+
+        function updateMicButton(state) {
+            const states = {
+                off:        { text: '🎙', title: 'Activer le micro',   cls: '' },
+                listening:  { text: '👂', title: 'Bob écoute...',      cls: 'listening' },
+                speaking:   { text: '🔴', title: "Je t'entends...",    cls: 'speaking' },
+                silence:    { text: '⏳', title: 'Envoi dans 1.5s...', cls: 'silence' },
+                processing: { text: '💭', title: 'Bob réfléchit...',   cls: 'processing' },
+            };
+            const s = states[state] || states.off;
+            micBtn.textContent = s.text;
+            micBtn.title = s.title;
+            micBtn.className = s.cls;
+        }
+
+        async function startListening() {
+            if (isProcessing) return;
+
+            try {
+                micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (err) {
+                appendMessage("Impossible d'accéder au micro : " + err.message, 'bot error');
+                voiceModeActive = false;
+                updateMicButton('off');
+                return;
+            }
+
+            audioContext = new AudioContext();
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 512;
+            audioContext.createMediaStreamSource(micStream).connect(analyser);
+
+            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                ? 'audio/webm;codecs=opus' : 'audio/webm';
+            mediaRecorder = new MediaRecorder(micStream, { mimeType });
+            audioChunks = [];
+            speechDetected = false;
+            speechStartTime = null;
+
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) audioChunks.push(e.data);
+            };
+
+            mediaRecorder.onstop = async () => {
+                micStream.getTracks().forEach(t => t.stop());
+                audioContext.close();
+                if (speechDetected && audioChunks.length > 0) {
+                    await sendVoiceMessage(new Blob(audioChunks, { type: 'audio/webm' }));
+                } else if (voiceModeActive) {
+                    startListening();
+                }
+            };
+
+            mediaRecorder.start(100);
+            isListening = true;
+            updateMicButton('listening');
+            detectSilence();
+        }
+
+        function detectSilence() {
+            if (!isListening) return;
+
+            const buffer = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(buffer);
+            const rms = Math.sqrt(buffer.reduce((sum, v) => sum + v * v, 0) / buffer.length);
+
+            if (rms > VAD_SILENCE_THRESHOLD) {
+                if (!speechDetected) {
+                    speechDetected = true;
+                    speechStartTime = Date.now();
+                }
+                clearTimeout(silenceTimer);
+                silenceTimer = null;
+                updateMicButton('speaking');
+            } else if (speechDetected) {
+                const speechDuration = Date.now() - (speechStartTime || 0);
+                if (speechDuration >= VAD_MIN_SPEECH_DURATION && !silenceTimer) {
+                    silenceTimer = setTimeout(stopListening, VAD_SILENCE_DURATION);
+                    updateMicButton('silence');
+                }
+            }
+
+            requestAnimationFrame(detectSilence);
+        }
+
+        function stopListening() {
+            isListening = false;
+            clearTimeout(silenceTimer);
+            silenceTimer = null;
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
+        }
+
+        function showThinkingBubble() {
+            const id = 'thinking-' + Date.now();
+            const div = document.createElement('div');
+            div.id = id;
+            div.className = 'message bot thinking';
+            div.textContent = '...';
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+            return id;
+        }
+
+        function removeThinkingBubble(id) {
+            const el = document.getElementById(id);
+            if (el) el.remove();
+        }
+
+        async function sendVoiceMessage(audioBlob) {
+            isProcessing = true;
+            updateMicButton('processing');
+            input.disabled = true;
+            sendBtn.disabled = true;
+
+            const thinkingId = showThinkingBubble();
+
+            const formData = new FormData();
+            formData.append('audio', audioBlob, 'voice.webm');
+            formData.append('session_id', sessionId || '');
+
+            try {
+                const response = await fetch('/chat-voice', {
+                    method: 'POST',
+                    headers: { 'X-CSRF-TOKEN': csrf },
+                    body: formData,
+                });
+
+                removeThinkingBubble(thinkingId);
+                const data = await response.json();
+
+                if (!response.ok) {
+                    appendMessage('Erreur : ' + (data.error || 'inconnue'), 'bot error');
+                    return;
+                }
+
+                if (data.transcription) appendMessage(data.transcription, 'user');
+                appendMessage(data.response, 'bot');
+
+                if (data.session_id) {
+                    sessionId = data.session_id;
+                    localStorage.setItem(STORAGE_KEY, sessionId);
+                    updateSessionInfo();
+                }
+
+                if (data.audio_base64) {
+                    const audio = new Audio('data:audio/mp3;base64,' + data.audio_base64);
+                    audio.onended = () => {
+                        isProcessing = false;
+                        if (voiceModeActive) startListening();
+                    };
+                    audio.onerror = () => {
+                        isProcessing = false;
+                        if (voiceModeActive) startListening();
+                    };
+                    audio.play().catch(() => {
+                        isProcessing = false;
+                        if (voiceModeActive) startListening();
+                    });
+                } else {
+                    isProcessing = false;
+                    if (voiceModeActive) startListening();
+                }
+            } catch (err) {
+                removeThinkingBubble(thinkingId);
+                appendMessage('Erreur réseau : ' + err.message, 'bot error');
+                isProcessing = false;
+                if (voiceModeActive) startListening();
+            } finally {
+                input.disabled = false;
+                sendBtn.disabled = false;
+                input.focus();
+            }
+        }
+
+        micBtn.addEventListener('click', () => {
+            if (!voiceModeActive) {
+                voiceModeActive = true;
+                startListening();
+            } else {
+                voiceModeActive = false;
+                isProcessing = false;
+                stopListening();
+                updateMicButton('off');
             }
         });
 
