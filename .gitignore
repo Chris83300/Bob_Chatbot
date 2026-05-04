@@ -26,3 +26,6 @@ Homestead.yaml
 Thumbs.db
 pycache/
 *.pyc
+.claude/
+CLAUDE.md
+CLAUDE_CODE_*.md
